@@ -1,3 +1,9 @@
+// todo:
+// - Obtain correct $$ options from Terje
+// - Address alarms to prevent lockout of jog (and drops into Critical Event needing reset - to fix)
+// - Improve reporting on enable/disable
+// - better way to handle enabled/disabled status for UI
+
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
@@ -5,16 +11,6 @@
 #include "grbl/nvs_buffer.h"
 #include "grbl/gcode.h"
 
-
-// todo:
-// - Obtain correct $$ options from Terje
-// - Address alarms to prevent lockout of jog (and drops into Critical Event needing reset - to fix)
-// - Improve reporting on enable/disable
-// - better way to handle enabled/disabled status for UI
-//
-
-
-// Keepout config stored in NVS
 typedef struct {
     float x_offset;
     float y_offset;
@@ -22,7 +18,6 @@ typedef struct {
     float y_height;
     bool enabled;
 } keepout_config_t;
-
 
 static keepout_config_t config;
 static nvs_address_t nvs_addr;
@@ -38,7 +33,7 @@ static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 #define SETTING_X_WIDTH    Setting_UserDefined_2
 #define SETTING_Y_HEIGHT   Setting_UserDefined_3
 
-// Setters for plugin settings
+// Settings
 static status_code_t set_setting(setting_id_t id, float value)
 {
     switch(id) {
@@ -53,7 +48,6 @@ static status_code_t set_setting(setting_id_t id, float value)
     return Status_OK;
 }
 
-// Getters for plugin settings
 static float get_setting(setting_id_t id)
 {
     switch(id) {
@@ -65,7 +59,6 @@ static float get_setting(setting_id_t id)
     }
 }
 
-// Plugin settings definitions
 static const setting_detail_t plugin_settings[] = {
     { SETTING_X_OFFSET, Group_UserSettings, "Keepout X Offset", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
     { SETTING_Y_OFFSET, Group_UserSettings, "Keepout Y Offset", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
@@ -73,7 +66,7 @@ static const setting_detail_t plugin_settings[] = {
     { SETTING_Y_HEIGHT, Group_UserSettings, "Keepout Y Height", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
 };
 
-// travel limits filter — checks if target is inside the keepout zone
+// Keepout Logic
 static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian)
 {
     float x = target[X_AXIS];
@@ -86,17 +79,16 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
         float ymax = -config.y_offset;
 
         if (x >= xmin && x <= xmax && y >= ymin && y <= ymax) {
-            report_message("Keepout zone: move blocked", Message_Warning); // in contrast with Jog move blocked (apply_travel_limits) this checks other moves
-            system_raise_alarm(Alarm_SoftLimit);
+            report_message("Keepout zone: move blocked", Message_Warning);
+            //system_raise_alarm(Alarm_SoftLimit);
             return false;
         }
     }
 
-    // Chain to original travel limits checker if any
     return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian) : true;
 }
 
-// The apply_travel_limits filter for jog moves (void return)
+
 static void keepout_apply_travel_limits(float *target, float *current_position)
 {
     float x = target[X_AXIS];
@@ -110,19 +102,18 @@ static void keepout_apply_travel_limits(float *target, float *current_position)
 
         if (x >= xmin && x <= xmax && y >= ymin && y <= ymax) {
             report_message("Keepout zone: Jog move blocked", Message_Warning);
-
-            // Set fault to soft limit error, stop jog immediately
-            system_raise_alarm(Alarm_SoftLimit);
+            // You CANNOT raise an alarm here or return error
+            // All you can do is prevent modifying target[] if needed
+            memcpy(target, current_position, sizeof(float) * N_AXIS); // block move
             return;
         }
     }
 
-    // Chain to original apply_travel_limits if any
     if (prev_apply_travel_limits)
         prev_apply_travel_limits(target, current_position);
 }
 
-// M-code check to identify which M-codes this plugin handles
+// M-code Handler
 static user_mcode_type_t mcode_check(user_mcode_t mcode)
 {
     if(mcode == 810 || mcode == 811)
@@ -130,14 +121,12 @@ static user_mcode_type_t mcode_check(user_mcode_t mcode)
     return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
 }
 
-// M-code validation — accept all for now
 static status_code_t mcode_validate(parser_block_t *gc_block)
 {
     (void)gc_block;
     return Status_OK;
 }
 
-// M-code execution — enable or disable keepout zone
 static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
 {
     if(state == STATE_CHECK_MODE)
@@ -161,7 +150,8 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
     }
 }
 
-// Restore defaults if NVS is empty or invalid
+// --- Persistence ---
+
 static void keepout_restore(void)
 {
     config.x_offset = 50.0f;
@@ -173,25 +163,23 @@ static void keepout_restore(void)
     hal.nvs.memcpy_to_nvs(nvs_addr, (uint8_t *)&config, sizeof(config), true);
 }
 
-// Load settings from NVS or restore defaults
 static void keepout_load(void)
 {
     if (hal.nvs.memcpy_from_nvs((uint8_t *)&config, nvs_addr, sizeof(config), true) != NVS_TransferResult_OK)
         keepout_restore();
 }
 
-// Hook into grbl's report options to show plugin info
+// Reporting
 static void onReportOptions(bool newopt)
 {
     if(on_report_options)
         on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("SIENCI Keepout Plugin", "0.2");
-
+        report_plugin("SIENCI Keepout Plugin", "0.3");
 }
 
-// Plugin initialization function
+// Init
 void keepout_init(void)
 {
     static setting_details_t settings = {
@@ -204,21 +192,20 @@ void keepout_init(void)
     if((nvs_addr = nvs_alloc(sizeof(config)))) {
         keepout_load();
 
-        // Hook travel limits check
+        // Hook travel limits
         prev_check_travel_limits = grbl.check_travel_limits;
         grbl.check_travel_limits = travel_limits_check;
 
-        // Hook apply travel limits for jog moves
         prev_apply_travel_limits = grbl.apply_travel_limits;
         grbl.apply_travel_limits = keepout_apply_travel_limits;
 
-        // Hook M-code handlers
+        // Hook M-codes
         memcpy(&user_mcode, &grbl.user_mcode, sizeof(user_mcode_ptrs_t));
         grbl.user_mcode.check = mcode_check;
         grbl.user_mcode.validate = mcode_validate;
         grbl.user_mcode.execute = mcode_execute;
 
-        // Hook report options callback
+        // Hook report
         on_report_options = grbl.on_report_options;
         grbl.on_report_options = onReportOptions;
 
