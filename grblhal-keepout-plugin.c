@@ -13,11 +13,12 @@ extern system_t sys;
 // #define KEEP_DEBUG 1
 
 typedef struct {
-    float x_offset;
-    float y_offset;
-    float x_width;
-    float y_height;
-    bool enabled;
+    float x_min;
+    float y_min;
+    float x_max;
+    float y_max;
+    bool enabled;        // M810/M811 toggle for the keepout zone
+    bool plugin_enabled; // Master on/off switch for the plugin from settings
 } keepout_config_t;
 
 static keepout_config_t config;
@@ -26,19 +27,26 @@ static nvs_address_t nvs_addr;
 static user_mcode_ptrs_t user_mcode = {0};
 static on_report_options_ptr on_report_options = NULL;
 
+// Updated typedefs to match current machine_limits.c
+typedef bool (*travel_limits_ptr)(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope);
+typedef void (*apply_travel_limits_ptr)(float *target, float *position, work_envelope_t *envelope);
+typedef bool (*arc_limits_ptr)(coord_data_t *target, coord_data_t *position, point_2d_t center, float radius, plane_t plane, int32_t turns, work_envelope_t *envelope);
+
 static travel_limits_ptr prev_check_travel_limits = NULL;
 static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 static arc_limits_ptr prev_check_arc_limits = NULL;
 
-#define SETTING_X_OFFSET   Setting_UserDefined_0
-#define SETTING_Y_OFFSET   Setting_UserDefined_1
-#define SETTING_X_WIDTH    Setting_UserDefined_2
-#define SETTING_Y_HEIGHT   Setting_UserDefined_3
+#define SETTING_X_MIN           Setting_UserDefined_0
+#define SETTING_Y_MIN           Setting_UserDefined_1
+#define SETTING_X_MAX           Setting_UserDefined_2
+#define SETTING_Y_MAX           Setting_UserDefined_3
+#define SETTING_PLUGIN_ENABLE   Setting_UserDefined_4
 
-static inline float keepout_xmin(void) { return -config.x_offset - config.x_width; }
-static inline float keepout_xmax(void) { return -config.x_offset; }
-static inline float keepout_ymin(void) { return -config.y_offset - config.y_height; }
-static inline float keepout_ymax(void) { return -config.y_offset; }
+static inline float keepout_xmin(void) { return config.x_min < config.x_max ? config.x_min : config.x_max; }
+static inline float keepout_xmax(void) { return config.x_min < config.x_max ? config.x_max : config.x_min; }
+static inline float keepout_ymin(void) { return config.y_min < config.y_max ? config.y_min : config.y_max; }
+static inline float keepout_ymax(void) { return config.y_min < config.y_max ? config.y_max : config.y_min; }
+
 
 static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
 {
@@ -70,10 +78,11 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
     return true;
 }
 
-static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian)
+static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope)
 {
-    if (!config.enabled)
-        return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian) : true;
+    // If plugin is disabled in settings, or toggled off via M-code, bypass check
+    if (!config.plugin_enabled || !config.enabled)
+        return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian, envelope) : true;
 
     float xt = target[X_AXIS];
     float yt = target[Y_AXIS];
@@ -100,15 +109,15 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
         return false;
     }
 
-    return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian) : true;
+    return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian, envelope) : true;
 }
 
-
-static void keepout_apply_travel_limits(float *target, float *current_position)
+static void keepout_apply_travel_limits(float *target, float *current_position, work_envelope_t *envelope)
 {
-    if (!config.enabled) {
+    // If plugin is disabled in settings, or toggled off via M-code, bypass check
+    if (!config.plugin_enabled || !config.enabled) {
         if (prev_apply_travel_limits)
-            prev_apply_travel_limits(target, current_position);
+            prev_apply_travel_limits(target, current_position, envelope);
         return;
     }
 
@@ -131,14 +140,16 @@ static void keepout_apply_travel_limits(float *target, float *current_position)
     }
 
     if (prev_apply_travel_limits)
-        prev_apply_travel_limits(target, current_position);
+        prev_apply_travel_limits(target, current_position, envelope);
 }
-
 
 static user_mcode_type_t mcode_check(user_mcode_t mcode)
 {
-    return (mcode == 810 || mcode == 811) ? UserMCode_Normal :
-           user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
+    // Only recognize M810/M811 if the plugin is enabled in settings
+    if (config.plugin_enabled && (mcode == 810 || mcode == 811))
+        return UserMCode_Normal;
+
+    return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
 }
 
 static status_code_t mcode_validate(parser_block_t *gc_block)
@@ -173,10 +184,11 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
 static status_code_t set_setting(setting_id_t id, float value)
 {
     switch(id) {
-        case SETTING_X_OFFSET:  config.x_offset = value; break;
-        case SETTING_Y_OFFSET:  config.y_offset = value; break;
-        case SETTING_X_WIDTH:   config.x_width  = value; break;
-        case SETTING_Y_HEIGHT:  config.y_height = value; break;
+        case SETTING_X_MIN:           config.x_min = value; break;
+        case SETTING_Y_MIN:           config.y_min = value; break;
+        case SETTING_X_MAX:           config.x_max  = value; break;
+        case SETTING_Y_MAX:           config.y_max = value; break;
+        case SETTING_PLUGIN_ENABLE:   config.plugin_enabled = (value != 0.0f); break;
         default: return Status_Unhandled;
     }
 
@@ -187,28 +199,31 @@ static status_code_t set_setting(setting_id_t id, float value)
 static float get_setting(setting_id_t id)
 {
     switch(id) {
-        case SETTING_X_OFFSET:  return config.x_offset;
-        case SETTING_Y_OFFSET:  return config.y_offset;
-        case SETTING_X_WIDTH:   return config.x_width;
-        case SETTING_Y_HEIGHT:  return config.y_height;
+        case SETTING_X_MIN:           return config.x_min;
+        case SETTING_Y_MIN:           return config.y_min;
+        case SETTING_X_MAX:           return config.x_max;
+        case SETTING_Y_MAX:           return config.y_max;
+        case SETTING_PLUGIN_ENABLE:   return config.plugin_enabled;
         default: return 0.0f;
     }
 }
 
 static const setting_detail_t plugin_settings[] = {
-    { SETTING_X_OFFSET, Group_UserSettings, "Keepout X Offset", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
-    { SETTING_Y_OFFSET, Group_UserSettings, "Keepout Y Offset", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
-    { SETTING_X_WIDTH,  Group_UserSettings, "Keepout X Width",  "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
-    { SETTING_Y_HEIGHT, Group_UserSettings, "Keepout Y Height", "mm", Format_Decimal, "#0.00", NULL, NULL, Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_X_MIN,         Group_UserSettings, "Keepout X Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_Y_MIN,         Group_UserSettings, "Keepout Y Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_X_MAX,         Group_UserSettings, "Keepout X Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_Y_MAX,         Group_UserSettings, "Keepout Y Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_PLUGIN_ENABLE, Group_UserSettings, "Keepout Plugin Enabled", NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, set_setting, get_setting },
 };
 
 static void keepout_restore(void)
 {
-    config.x_offset = 50.0f;
-    config.y_offset = 50.0f;
-    config.x_width  = 40.0f;
-    config.y_height = 40.0f;
+    config.x_min = 10.0f;
+    config.y_min = 10.0f;
+    config.x_max = 50.0f;
+    config.y_max = 50.0f;
     config.enabled  = true;
+    config.plugin_enabled = false; // Default to OFF
 
     hal.nvs.memcpy_to_nvs(nvs_addr, (uint8_t *)&config, sizeof(config), true);
 }
@@ -225,7 +240,7 @@ static void onReportOptions(bool newopt)
         on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("SIENCI Keepout Plugin", "0.5");
+        report_plugin("SIENCI Keepout Plugin", "0.7"); // Version bump
 }
 
 void keepout_init(void)
