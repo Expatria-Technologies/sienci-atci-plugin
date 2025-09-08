@@ -7,6 +7,7 @@
 #include "grbl/gcode.h"
 #include "grbl/system.h"
 #include "grbl/motion_control.h"
+#include "grbl/settings.h" // Required for checking soft limit status
 
 extern system_t sys;
 
@@ -36,11 +37,11 @@ static travel_limits_ptr prev_check_travel_limits = NULL;
 static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 static arc_limits_ptr prev_check_arc_limits = NULL;
 
-#define SETTING_X_MIN           Setting_UserDefined_0
-#define SETTING_Y_MIN           Setting_UserDefined_1
+#define SETTING_PLUGIN_ENABLE   Setting_UserDefined_0
+#define SETTING_X_MIN           Setting_UserDefined_1
 #define SETTING_X_MAX           Setting_UserDefined_2
-#define SETTING_Y_MAX           Setting_UserDefined_3
-#define SETTING_PLUGIN_ENABLE   Setting_UserDefined_4
+#define SETTING_Y_MIN           Setting_UserDefined_3
+#define SETTING_Y_MAX           Setting_UserDefined_4
 
 static inline float keepout_xmin(void) { return config.x_min < config.x_max ? config.x_min : config.x_max; }
 static inline float keepout_xmax(void) { return config.x_min < config.x_max ? config.x_max : config.x_min; }
@@ -152,9 +153,24 @@ static user_mcode_type_t mcode_check(user_mcode_t mcode)
     return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
 }
 
-static status_code_t mcode_validate(parser_block_t *gc_block)
+static void report_keepout_status(void)
 {
-    return Status_OK;
+    char report_buf[150]; // A sufficiently large buffer
+
+    // Build the entire string using snprintf for safety and formatting
+    snprintf(report_buf, sizeof(report_buf),
+             "[SKO:%d|STATUS:%s|XMIN:%.2f|XMAX:%.2f|YMIN:%.2f|YMAX:%.2f|SOFTLIM:%s]",
+             config.plugin_enabled ? 1 : 0,
+             config.enabled ? "ENABLED" : "DISABLED",
+             keepout_xmin(),
+             keepout_xmax(),
+             keepout_ymin(),
+             keepout_ymax(),
+             (settings.limits.soft_enabled.mask != 0) ? "TRUE" : "FALSE"); // Corrected soft limit check
+
+    // Print the final string to the stream
+    hal.stream.write(report_buf);
+    hal.stream.write(ASCII_EOL);
 }
 
 static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
@@ -164,31 +180,32 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
 
     if (gc_block->user_mcode == 810) {
         config.enabled = true;
-        report_message("Keepout ENABLED", Message_Info);
         prev_check_arc_limits = grbl.check_arc_travel_limits;
         grbl.check_arc_travel_limits = NULL;
 
-        char region[100];
-        snprintf(region, sizeof(region), "Keepout: X[%.2f..%.2f] Y[%.2f..%.2f]",
-            keepout_xmin(), keepout_xmax(), keepout_ymin(), keepout_ymax());
-        report_message(region, Message_Info);
-
     } else if (gc_block->user_mcode == 811) {
         config.enabled = false;
-        report_message("Keepout DISABLED", Message_Info);
         if (prev_check_arc_limits)
             grbl.check_arc_travel_limits = prev_check_arc_limits;
     }
+
+    // Report the new status in the requested format
+    report_keepout_status();
+}
+
+static status_code_t mcode_validate(parser_block_t *gc_block)
+{
+    return Status_OK;
 }
 
 static status_code_t set_setting(setting_id_t id, float value)
 {
     switch(id) {
-        case SETTING_X_MIN:           config.x_min = value; break;
-        case SETTING_Y_MIN:           config.y_min = value; break;
-        case SETTING_X_MAX:           config.x_max  = value; break;
-        case SETTING_Y_MAX:           config.y_max = value; break;
         case SETTING_PLUGIN_ENABLE:   config.plugin_enabled = (value != 0.0f); break;
+        case SETTING_X_MIN:           config.x_min = value; break;
+        case SETTING_X_MAX:           config.x_max  = value; break;
+        case SETTING_Y_MIN:           config.y_min = value; break;
+        case SETTING_Y_MAX:           config.y_max = value; break;
         default: return Status_Unhandled;
     }
 
@@ -199,21 +216,21 @@ static status_code_t set_setting(setting_id_t id, float value)
 static float get_setting(setting_id_t id)
 {
     switch(id) {
-        case SETTING_X_MIN:           return config.x_min;
-        case SETTING_Y_MIN:           return config.y_min;
-        case SETTING_X_MAX:           return config.x_max;
-        case SETTING_Y_MAX:           return config.y_max;
         case SETTING_PLUGIN_ENABLE:   return config.plugin_enabled;
+        case SETTING_X_MIN:           return config.x_min;
+        case SETTING_X_MAX:           return config.x_max;
+        case SETTING_Y_MIN:           return config.y_min;
+        case SETTING_Y_MAX:           return config.y_max;
         default: return 0.0f;
     }
 }
 
 static const setting_detail_t plugin_settings[] = {
-    { SETTING_X_MIN,         Group_UserSettings, "Keepout X Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
-    { SETTING_Y_MIN,         Group_UserSettings, "Keepout Y Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
-    { SETTING_X_MAX,         Group_UserSettings, "Keepout X Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
-    { SETTING_Y_MAX,         Group_UserSettings, "Keepout Y Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
     { SETTING_PLUGIN_ENABLE, Group_UserSettings, "Keepout Plugin Enabled", NULL, Format_Bool,    NULL,       NULL,     NULL,    Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_X_MIN,         Group_UserSettings, "Keepout X Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_X_MAX,         Group_UserSettings, "Keepout X Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_Y_MIN,         Group_UserSettings, "Keepout Y Min",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
+    { SETTING_Y_MAX,         Group_UserSettings, "Keepout Y Max",          "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_IsLegacyFn, set_setting, get_setting },
 };
 
 static void keepout_restore(void)
@@ -240,7 +257,7 @@ static void onReportOptions(bool newopt)
         on_report_options(newopt);
 
     if(!newopt)
-        report_plugin("SIENCI Keepout Plugin", "0.7"); // Version bump
+        report_plugin("SIENCI Keepout Plugin", "1.4"); // Version bump for correct soft limit check
 }
 
 void keepout_init(void)
