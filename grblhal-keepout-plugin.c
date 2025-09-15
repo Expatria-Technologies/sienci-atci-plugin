@@ -10,22 +10,31 @@
 #include "grbl/motion_control.h"
 #include "grbl/settings.h"
 #include "grbl/plugins.h"
+#include "grbl/task.h" // Required for periodic tasks
 
 extern system_t sys;
 
 // #define KEEP_DEBUG 1
+
+// This enum tracks the source of the LAST event that set the keepout state.
+typedef enum {
+    SOURCE_STARTUP,
+    SOURCE_RACK,
+    SOURCE_COMMAND,
+    SOURCE_MACRO
+} keepout_source_t;
 
 typedef struct {
     float x_min;
     float y_min;
     float x_max;
     float y_max;
-    bool enabled;             // Current enabled/disabled state.
-    bool plugin_enabled;      // Master on/off switch for the plugin from settings.
-    bool monitor_rack_presence; // Setting to enable/disable pin monitoring.
-    bool monitor_tc_macro;    // Setting to enable/disable toolchange macro monitoring.
-    bool manual_override;     // Flag to indicate M810 or a TC Macro has forced the state.
-    bool last_pin_state;      // The last seen state of the input pin (true = LOW/present).
+    bool enabled;                 // The final, effective state of the keepout zone.
+    keepout_source_t source;      // The source of the last event.
+    bool plugin_enabled;          // Master on/off switch for the plugin.
+    bool monitor_rack_presence;   // Setting to enable/disable pin monitoring.
+    bool monitor_tc_macro;        // Setting to enable/disable TC macro monitoring.
+    bool last_pin_state;          // The last seen state of the input pin (true = LOW/present).
 } keepout_config_t;
 
 static keepout_config_t config;
@@ -33,9 +42,11 @@ static nvs_address_t nvs_addr;
 
 static user_mcode_ptrs_t user_mcode = {0};
 static on_report_options_ptr on_report_options = NULL;
-static on_tool_selected_ptr prev_on_tool_selected = NULL; // FIX: Use 'prev_' convention for clarity and safety
-static on_tool_changed_ptr prev_on_tool_changed = NULL;   // FIX: Use 'prev_' convention
+static on_realtime_report_ptr on_realtime_report = NULL;
+static on_tool_selected_ptr prev_on_tool_selected = NULL;
+static on_tool_changed_ptr prev_on_tool_changed = NULL;
 static bool p_word_present = false;
+static bool tc_macro_running = false; // Transient state for TC macro
 
 // Typedefs for the original limit checking functions we are overriding
 typedef bool (*travel_limits_ptr)(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope);
@@ -53,20 +64,57 @@ static apply_travel_limits_ptr prev_apply_travel_limits = NULL;
 #define SETTING_X_MAX                 Setting_UserDefined_5
 #define SETTING_Y_MAX                 Setting_UserDefined_6
 
-// Forward declarations for our separate getter/setter functions
-static status_code_t set_bool_setting(setting_id_t id, uint_fast16_t value);
-static uint_fast16_t get_bool_setting(setting_id_t id);
-static status_code_t set_float_setting(setting_id_t id, float value);
-static float get_float_setting(setting_id_t id);
-static void keepout_tool_selected(tool_data_t *tool);
-static void keepout_tool_changed(tool_data_t *tool);
+// Forward declarations
+static void set_keepout_state(bool new_state, keepout_source_t event_source);
 
 static inline float keepout_xmin(void) { return config.x_min < config.x_max ? config.x_min : config.x_max; }
 static inline float keepout_xmax(void) { return config.x_min < config.x_max ? config.x_max : config.x_min; }
 static inline float keepout_ymin(void) { return config.y_min < config.y_max ? config.y_min : config.y_max; }
 static inline float keepout_ymax(void) { return config.y_min < config.y_max ? config.y_max : config.y_min; }
 
-static void report_keepout_status(void); // Forward declaration
+// This is now the ONLY function that changes the state. "Last Write Wins".
+static void set_keepout_state(bool new_state, keepout_source_t event_source) {
+    if (config.enabled != new_state || config.source != event_source) {
+        config.enabled = new_state;
+        config.source = event_source;
+    }
+}
+
+// EVENT: Tool change macro begins.
+static void keepout_tool_selected(tool_data_t *tool) {
+    if (config.plugin_enabled && config.monitor_tc_macro) {
+        tc_macro_running = true;
+        set_keepout_state(false, SOURCE_MACRO); // Fires a "disable" event.
+    }
+    if (prev_on_tool_selected) {
+        prev_on_tool_selected(tool);
+    }
+}
+
+// EVENT: Tool change macro has completed.
+static void keepout_tool_changed(tool_data_t *tool) {
+    if (config.plugin_enabled && config.monitor_tc_macro) {
+        tc_macro_running = false;
+        // After a macro, the state should revert to what the rack sensor dictates.
+        bool rack_is_installed = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
+        set_keepout_state(rack_is_installed, SOURCE_RACK); // Fires an event based on current rack state.
+    }
+    if (prev_on_tool_changed) {
+        prev_on_tool_changed(tool);
+    }
+}
+
+// EVENT: Rack sensor pin changes state.
+static void poll_rack_sensor(void *data) {
+    if (config.plugin_enabled && config.monitor_rack_presence) {
+        bool current_pin_is_low = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
+        if (current_pin_is_low != config.last_pin_state) {
+            config.last_pin_state = current_pin_is_low;
+            set_keepout_state(current_pin_is_low, SOURCE_RACK); // Fires an event with the new rack state.
+        }
+    }
+    task_add_delayed(poll_rack_sensor, NULL, 100); // Re-schedule for 100ms later
+}
 
 static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
 {
@@ -95,23 +143,8 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
     return true;
 }
 
-static bool is_keepout_active(void)
-{
-    if (!config.plugin_enabled) {
-        return false;
-    }
-    if (config.manual_override) {
-        return config.enabled;
-    }
-    if (config.monitor_rack_presence) {
-        bool current_pin_is_low = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
-        if (current_pin_is_low != config.last_pin_state) {
-            config.last_pin_state = current_pin_is_low;
-            config.enabled = current_pin_is_low;
-            report_keepout_status();
-        }
-    }
-    return config.enabled;
+static bool is_keepout_active(void) {
+    return config.plugin_enabled && config.enabled;
 }
 
 static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cartesian, work_envelope_t *envelope)
@@ -185,62 +218,10 @@ static status_code_t mcode_validate(parser_block_t *gc_block)
     return state == Status_Unhandled && user_mcode.validate ? user_mcode.validate(gc_block) : state;
 }
 
-static void keepout_tool_selected (tool_data_t *tool)
-{
-    // FIX: Only act if the feature is enabled in settings
-    if(config.plugin_enabled && config.monitor_tc_macro) {
-        config.enabled = false;
-        config.manual_override = true; // LOGIC FIX: Override must be set to ignore the rack sensor
-        report_keepout_status(); // SYNTAX FIX: Added semicolon
-    }
-    if(prev_on_tool_selected) { // FIX: Use the saved 'prev_' pointer
-        prev_on_tool_selected(tool);
-    }
-}
 
-static void keepout_tool_changed (tool_data_t *tool)
-{
-    if(prev_on_tool_changed) { // FIX: Use the saved 'prev_' pointer
-        prev_on_tool_changed(tool);
-    }
-    // FIX: Only act if the feature is enabled in settings
-    if(config.plugin_enabled && config.monitor_tc_macro) {
-        config.manual_override = false; // LOGIC FIX: Clear the override to return control to the sensor
-        is_keepout_active(); // LOGIC FIX: Force a re-evaluation based on the current sensor state
-        report_keepout_status(); // SYNTAX FIX: Added semicolon
-    }
-}
-
-static void report_keepout_status(void)
-{
-    char report_buf[220];
-    const char *rack_status_str;
-
-    if(config.monitor_rack_presence) {
-        rack_status_str = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN) ? "INSTALLED" : "REMOVED";
-    } else {
-        rack_status_str = "N/A";
-    }
-
-    snprintf(report_buf, sizeof(report_buf),
-             "[SKO:%d|STATUS:%s|OVERRIDE:%s|XMIN:%.2f|XMAX:%.2f|YMIN:%.2f|YMAX:%.2f|SOFTLIM:%s|RACK:%s]",
-             config.plugin_enabled,
-             config.enabled ? "ENABLED" : "DISABLED",
-             config.manual_override ? "TRUE" : "FALSE",
-             keepout_xmin(),
-             keepout_xmax(),
-             keepout_ymin(),
-             keepout_ymax(),
-             (settings.limits.soft_enabled.mask != 0) ? "TRUE" : "FALSE",
-             rack_status_str);
-
-    hal.stream.write(report_buf);
-    hal.stream.write(ASCII_EOL);
-}
-
+// EVENT: M810 command is executed.
 static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
 {
-    // CRITICAL FIX: If this m-code is not for us, we must pass it to the next plugin in the chain.
     if (gc_block->user_mcode != 810) {
         if (user_mcode.execute) {
             user_mcode.execute(state, gc_block);
@@ -248,20 +229,15 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
         return;
     }
 
-    if(state == STATE_CHECK_MODE) {
+    if (!config.plugin_enabled || state == STATE_CHECK_MODE) {
         return;
     }
 
     if (p_word_present) {
-        config.enabled = (gc_block->values.p == 1.0f);
-        config.manual_override = true;
+        set_keepout_state(gc_block->values.p == 1.0f, SOURCE_COMMAND); // Fires an enable/disable event.
     } else {
-        report_keepout_status();
         report_message("Use M810 P1 to enable keepout, M810 P0 to disable.", Message_Info);
-        return;
     }
-
-    report_keepout_status();
 }
 
 static status_code_t set_bool_setting(setting_id_t id, uint_fast16_t value) {
@@ -326,25 +302,65 @@ static void keepout_restore(void)
     config.enabled  = true;
     config.plugin_enabled = false;
     config.monitor_rack_presence = false;
-    config.monitor_tc_macro = false; // FIX: Added new setting
-    config.manual_override = false;
+    config.monitor_tc_macro = false;
     config.last_pin_state = false;
     hal.nvs.memcpy_to_nvs(nvs_addr, (uint8_t *)&config, sizeof(config), true);
 }
 
 static void keepout_load(void)
 {
-    if (hal.nvs.memcpy_from_nvs((uint8_t *)&config, nvs_addr, sizeof(config), true) != NVS_TransferResult_OK)
+    if (hal.nvs.memcpy_from_nvs((uint8_t *)&config, nvs_addr, sizeof(config), true) != NVS_TransferResult_OK) {
         keepout_restore();
+    }
 }
 
 static void onReportOptions(bool newopt)
 {
-    if(on_report_options)
+    if(on_report_options) {
         on_report_options(newopt);
-    if(!newopt)
-        report_plugin("SIENCI Keepout Plugin", "0.0.8");
+    }
+    if(!newopt) {
+        report_plugin("SIENCI Keepout Plugin", "0.0.9");
+    }
 }
+
+static void onRealtimeReport (stream_write_ptr stream_write, report_tracking_flags_t report)
+{
+    char buf[128];
+    char flags[8];
+    size_t f = 0;
+
+    // Add flags
+    if(config.enabled)
+        flags[f++] = 'E';
+
+    switch(config.source) {
+        case SOURCE_RACK:    flags[f++] = 'R'; break;
+        case SOURCE_COMMAND: flags[f++] = 'M'; break;
+        case SOURCE_MACRO:   flags[f++] = 'T'; break;
+        case SOURCE_STARTUP: flags[f++] = 'S'; break;
+        default: break;
+    }
+
+    if(config.monitor_rack_presence && config.last_pin_state)
+        flags[f++] = 'I';   // Rack Installed
+
+    flags[f] = '\0'; // terminate string
+
+    snprintf(buf, sizeof(buf),
+             "|Sko:%.2f,%.2f,%.2f,%.2f,%s",
+             keepout_xmax(),
+             keepout_xmin(),
+             keepout_ymax(),
+             keepout_ymin(),
+             flags);
+
+    stream_write(buf);
+
+    if(on_realtime_report)
+        on_realtime_report(stream_write, report);
+}
+
 
 void keepout_init(void)
 {
@@ -354,35 +370,45 @@ void keepout_init(void)
         .load = keepout_load,
         .restore = keepout_restore
     };
-
     if ((nvs_addr = nvs_alloc(sizeof(config)))) {
         keepout_load();
-        if(config.plugin_enabled && config.monitor_rack_presence) {
+
+        tc_macro_running = false;
+        if (config.monitor_rack_presence) {
             config.last_pin_state = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
-            config.enabled = config.last_pin_state;
-            config.manual_override = false;
+            set_keepout_state(config.last_pin_state, SOURCE_RACK);
+        } else {
+            set_keepout_state(true, SOURCE_STARTUP);
         }
 
+        // Tie ins for soft limits
         prev_check_travel_limits = grbl.check_travel_limits;
         grbl.check_travel_limits = travel_limits_check;
         prev_apply_travel_limits = grbl.apply_travel_limits;
         grbl.apply_travel_limits = keepout_apply_travel_limits;
 
+        // Manual mCode commands
         memcpy(&user_mcode, &grbl.user_mcode, sizeof(user_mcode_ptrs_t));
         grbl.user_mcode.check = mcode_check;
         grbl.user_mcode.validate = mcode_validate;
         grbl.user_mcode.execute = mcode_execute;
 
+        // $I+ report
         on_report_options = grbl.on_report_options;
         grbl.on_report_options = onReportOptions;
 
-        // FIX: Correctly chain the tool change hooks using 'prev_' pointers
+        // Realtime report
+        on_realtime_report = grbl.on_realtime_report;
+        grbl.on_realtime_report = onRealtimeReport;
+
+        // Tie into tc.macro
         prev_on_tool_selected = grbl.on_tool_selected;
         grbl.on_tool_selected = keepout_tool_selected;
         prev_on_tool_changed = grbl.on_tool_changed;
         grbl.on_tool_changed = keepout_tool_changed;
 
         settings_register(&settings);
-        report_message("Keepout plugin v0.0.8 initialized", Message_Info);
+        task_add_delayed(poll_rack_sensor, NULL, 1000); // Start polling after 1s
+        report_message("Keepout plugin v0.0.9 initialized", Message_Info);
     }
 }
