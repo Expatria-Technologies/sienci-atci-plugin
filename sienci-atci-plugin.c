@@ -153,8 +153,8 @@ static void poll_rack_sensor(void *data)
     float *pos = plan_get_position();
     if (pos) {
         inside_keepout_zone =
-            (pos[X_AXIS] >= atci.x_min && pos[X_AXIS] <= atci.x_max &&
-             pos[Y_AXIS] >= atci.y_min && pos[Y_AXIS] <= atci.y_max);
+          (pos[X_AXIS] > atci.x_min && pos[X_AXIS] < atci.x_max &&
+           pos[Y_AXIS] > atci.y_min && pos[Y_AXIS] < atci.y_max);
     } else {
         inside_keepout_zone = false;
     }
@@ -202,8 +202,10 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     float x0 = pos ? pos[X_AXIS] : 0.0f;
     float y0 = pos ? pos[Y_AXIS] : 0.0f;
 
+    bool currently_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
+
     if (xt >= atci.x_min && xt <= atci.x_max && yt >= atci.y_min && yt <= atci.y_max) {
-        if (inside_keepout_zone)
+        if (currently_inside)
             report_message("ATCI: You are currently inside the keepout zone", Message_Warning);
         else
             report_message("ATCI: Target inside region", Message_Warning);
@@ -284,7 +286,10 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
     float xt = target[X_AXIS];
     float yt = target[Y_AXIS];
 
-    if (inside_keepout_zone) {
+    bool currently_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
+
+
+    if (currently_inside) {
         report_message("ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety", Message_Warning);
         memcpy(target, current_position, sizeof(float) * N_AXIS); /* Block move */
         return;
