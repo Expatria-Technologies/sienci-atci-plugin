@@ -13,6 +13,21 @@
 #include "grbl/plugins.h"
 #include "grbl/task.h"
 
+/*
+   TOLERANCE BUFFER
+   We only flag the tool as "Trapped" (blocking ALL movement) if it is deeper
+   than this value inside the zone.
+*/
+#define KEEPOUT_TOLERANCE 0.5f
+
+/*
+   Exact Message Strings needed by UI
+*/
+#define MSG_INSIDE_ZONE "ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety"
+#define MSG_BLOCKED_AT_WALL "ATCI: Jog move blocked at keepout boundary."
+#define MSG_CROSSING "ATCI: Move crosses keepout zone"
+#define MSG_TARGET_IN_ZONE "ATCI: Target inside region"
+
 extern system_t sys;
 
 typedef enum {
@@ -147,12 +162,17 @@ static void poll_rack_sensor(void *data)
     tool_sensor_state     = !DIGITAL_IN(AUXINPUT1_PORT, AUXINPUT1_PIN);
     pressure_sensor_state = !DIGITAL_IN(AUXINPUT2_PORT, AUXINPUT2_PIN);
 
-    /* Track if we are inside keepout zone (based on planner position) */
+    /*
+       Track if we are inside keepout zone (based on planner position).
+       NOTE: For Status Reporting 'Z' flag, we use the EXACT technical definition
+       (including sitting on the line), NOT the tolerance buffer.
+       If you are at Y0.00 and Zone starts at Y0.00, you are IN the zone ('Z').
+    */
     float *pos = plan_get_position();
     if (pos) {
         inside_keepout_zone =
-          (pos[X_AXIS] > atci.x_min && pos[X_AXIS] < atci.x_max &&
-           pos[Y_AXIS] > atci.y_min && pos[Y_AXIS] < atci.y_max);
+          (pos[X_AXIS] >= atci.x_min && pos[X_AXIS] <= atci.x_max &&
+           pos[Y_AXIS] >= atci.y_min && pos[Y_AXIS] <= atci.y_max);
     } else {
         inside_keepout_zone = false;
     }
@@ -185,7 +205,7 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
             }
         }
     }
-    /* CHANGED: Strict inequality allows touching (t0==t1) without flagging as intersection */
+    /* Strict inequality allows touching (t0==t1) without flagging as intersection */
     return t0 < t1;
 }
 
@@ -201,24 +221,52 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
     float x0 = pos ? pos[X_AXIS] : 0.0f;
     float y0 = pos ? pos[Y_AXIS] : 0.0f;
 
-    /* CHANGED: Use Strict Inequality (> <).
-       (10, 20) is NOT strictly inside, so we don't auto-block. */
-    bool strictly_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
+    /* We use the Tolerance here so we don't block moves if we are just sitting on the boundary. */
+    bool strictly_deep_inside = (x0 > (atci.x_min + KEEPOUT_TOLERANCE) &&
+                                 x0 < (atci.x_max - KEEPOUT_TOLERANCE) &&
+                                 y0 > (atci.y_min + KEEPOUT_TOLERANCE) &&
+                                 y0 < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    if (xt >= atci.x_min && xt <= atci.x_max && yt >= atci.y_min && yt <= atci.y_max) {
-        if (strictly_inside)
-            report_message("ATCI: You are currently inside the keepout zone", Message_Warning);
+    /*
+       "Technically Inside" check for messaging context.
+       Includes boundary lines. Used to determine if we give the "Stuck" message or "Blocked" message.
+    */
+    bool technically_inside = (x0 >= atci.x_min && x0 <= atci.x_max &&
+                               y0 >= atci.y_min && y0 <= atci.y_max);
+
+    /* Target deep inside check */
+    bool target_deep_inside = (xt > (atci.x_min + KEEPOUT_TOLERANCE) &&
+                               xt < (atci.x_max - KEEPOUT_TOLERANCE) &&
+                               yt > (atci.y_min + KEEPOUT_TOLERANCE) &&
+                               yt < (atci.y_max - KEEPOUT_TOLERANCE));
+
+    if (target_deep_inside) {
+        if (strictly_deep_inside || technically_inside)
+            report_message(MSG_INSIDE_ZONE, Message_Warning);
         else
-            report_message("ATCI: Target inside region", Message_Warning);
+            report_message(MSG_TARGET_IN_ZONE, Message_Warning);
         return false;
     }
 
+    /* Intersection check */
     if (line_intersects_keepout(x0, y0, xt, yt)) {
-        if (strictly_inside)
-            report_message("ATCI: You are currently inside the keepout zone", Message_Warning);
-        else
-            report_message("ATCI: Move crosses keepout zone", Message_Warning);
-        return false;
+        if (strictly_deep_inside) {
+            report_message(MSG_INSIDE_ZONE, Message_Warning);
+            return false;
+        }
+        /*
+           Message Priority:
+           If we are technically inside (e.g. on the line) and intersecting (trying to go deeper),
+           report the "Inside Zone" message so the UI shows the helper.
+        */
+        else if (technically_inside) {
+            report_message(MSG_INSIDE_ZONE, Message_Warning);
+            return false;
+        }
+        else {
+            report_message(MSG_CROSSING, Message_Warning);
+            return false;
+        }
     }
 
     return prev_check_travel_limits ? prev_check_travel_limits(target, axes, is_cartesian, envelope) : true;
@@ -287,30 +335,52 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
     float xt = target[X_AXIS];
     float yt = target[Y_AXIS];
 
-    /* CHANGED: Strict Inequality. */
-    bool strictly_inside = (x0 > atci.x_min && x0 < atci.x_max && y0 > atci.y_min && y0 < atci.y_max);
+    /* Deep check (Trap prevention using tolerance) */
+    bool strictly_deep_inside = (x0 > (atci.x_min + KEEPOUT_TOLERANCE) &&
+                                 x0 < (atci.x_max - KEEPOUT_TOLERANCE) &&
+                                 y0 > (atci.y_min + KEEPOUT_TOLERANCE) &&
+                                 y0 < (atci.y_max - KEEPOUT_TOLERANCE));
+
+    /* Technical check (Are we touching or inside geometry?) */
+    bool technically_inside = (x0 >= atci.x_min && x0 <= atci.x_max &&
+                               y0 >= atci.y_min && y0 <= atci.y_max);
 
     /* Only block if we are DEEP inside. If on boundary, allow through to intersection check. */
-    if (strictly_inside) {
-        report_message("ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety", Message_Warning);
+    if (strictly_deep_inside) {
+        report_message(MSG_INSIDE_ZONE, Message_Warning);
         memcpy(target, current_position, sizeof(float) * N_AXIS); /* Block move */
         return;
     }
 
-    /* Standard clipping logic proceeds here...
-       If on boundary and moving OUT: line_intersects_keepout returns false -> Allowed.
-       If on boundary and moving IN: line_intersects_keepout returns true -> Clipped.
-    */
-    bool in_box = (xt >= atci.x_min && xt <= atci.x_max && yt >= atci.y_min && yt <= atci.y_max);
     bool intersects = line_intersects_keepout(x0, y0, xt, yt);
+    bool target_deep_inside = (xt > (atci.x_min + KEEPOUT_TOLERANCE) &&
+                               xt < (atci.x_max - KEEPOUT_TOLERANCE) &&
+                               yt > (atci.y_min + KEEPOUT_TOLERANCE) &&
+                               yt < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    if (in_box || intersects) {
+    if (target_deep_inside || intersects) {
         float clipped_target[N_AXIS];
         if (calculate_clipped_point(current_position, target, clipped_target)) {
-            report_message("ATCI: Jog move clipped at keepout boundary.", Message_Warning);
+
+            /* Message Context logic:
+               If we clipped, we blocked a move.
+               If we were already "In" (technically, including edge), say "You are inside" to trigger help.
+               If we were "Out", say "Blocked at boundary".
+            */
+            if (technically_inside) {
+                report_message(MSG_INSIDE_ZONE, Message_Warning);
+            } else {
+                report_message(MSG_BLOCKED_AT_WALL, Message_Warning);
+            }
+
             memcpy(target, clipped_target, sizeof(float) * N_AXIS);
         } else {
-            report_message("ATCI: Jog move blocked at keepout boundary.", Message_Warning);
+            /* Fallback blocking */
+            if (technically_inside) {
+                report_message(MSG_INSIDE_ZONE, Message_Warning);
+            } else {
+                report_message(MSG_BLOCKED_AT_WALL, Message_Warning);
+            }
             memcpy(target, current_position, sizeof(float) * N_AXIS);
         }
         return;
@@ -423,7 +493,7 @@ static void onReportOptions(bool newopt)
     if (on_report_options)
         on_report_options(newopt);
     if (!newopt)
-        report_plugin("SIENCI ATCi plugin", "0.3.0");
+        report_plugin("SIENCI ATCi plugin", "0.3.3");
 }
 
 static void onReportNgcParameters(void)
@@ -529,6 +599,6 @@ void atci_init(void)
         settings_register(&settings);
         task_add_delayed(poll_rack_sensor, NULL, 1000); /* start polling after 1s */
 
-        report_message("Sienci ATCi plugin v0.3.0 initialized", Message_Info);
+        report_message("Sienci ATCi plugin v0.4.0 initialized", Message_Info);
     }
 }
