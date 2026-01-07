@@ -390,15 +390,15 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
         prev_apply_travel_limits(target, current_position, envelope);
 }
 
-/* --- M810 handlers --- */
-/* M810 toggles runtime-only keepout state (atci.enabled) */
+/* --- M960 handlers --- */
+/* M960 toggles runtime-only keepout state (atci.enabled) */
 
 static user_mcode_type_t mcode_check(user_mcode_t mcode)
 {
-    /* Recognize M810 always so it can be used to toggle runtime state,
+    /* Recognize M960 always so it can be used to toggle runtime state,
        but only advertise as normal if plugin persistent setting is enabled
        to keep UX similar to original — however we still accept it. */
-    if (mcode == 810)
+    if (mcode == 960)
         return UserMCode_Normal;
     return user_mcode.check ? user_mcode.check(mcode) : UserMCode_Unsupported;
 }
@@ -406,7 +406,7 @@ static user_mcode_type_t mcode_check(user_mcode_t mcode)
 static status_code_t mcode_validate(parser_block_t *gc_block)
 {
     status_code_t state = Status_Unhandled;
-    if (gc_block->user_mcode == 810) {
+    if (gc_block->user_mcode == 960) {
         state = Status_OK;
         if (gc_block->words.p) {
             if (gc_block->values.p != 0.0f && gc_block->values.p != 1.0f)
@@ -419,7 +419,7 @@ static status_code_t mcode_validate(parser_block_t *gc_block)
 
 static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
 {
-    if (gc_block->user_mcode != 810) {
+    if (gc_block->user_mcode != 960) {
         if (user_mcode.execute)
             user_mcode.execute(state, gc_block);
         return;
@@ -432,7 +432,7 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
     if (gc_block->words.p) {
         set_keepout_state(gc_block->values.p == 1.0f, SOURCE_COMMAND);
     } else {
-        report_message("Use M810 P1 to enable Sienci ATCi Keepout, M810 P0 to disable.", Message_Info);
+        report_message("Use M960 P1 to enable Sienci ATC Keepout, M960 P0 to disable.", Message_Info);
     }
 }
 
