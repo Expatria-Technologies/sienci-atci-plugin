@@ -37,7 +37,7 @@ The plugin adds the following settings to grblHAL. You must configure the bounda
 ## Usage
 
 ### M960 Command
-The plugin introduces `M810` to manually control the Keepout Zone enforcement state at runtime.
+The plugin introduces `M960` to manually control the Keepout Zone enforcement state at runtime.
 
 *   `M960 P1`: **Enable** Keepout Zone enforcement.
 *   `M960 P0`: **Disable** Keepout Zone enforcement.
