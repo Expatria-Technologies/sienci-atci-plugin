@@ -21,6 +21,12 @@
 #define KEEPOUT_TOLERANCE 0.5f
 
 /*
+   Microscopic tolerance to allow sliding exactly on the boundary line without
+   triggering intersection collisions or floating point snapping errors.
+*/
+#define BOUNDARY_EPSILON 0.001f
+
+/*
    Exact Message Strings needed by UI
 */
 #define MSG_INSIDE_ZONE "ATCI: You are currently inside the keepout zone. Disable keepout before Jogging to safety"
@@ -187,9 +193,14 @@ static bool line_intersects_keepout(float x0, float y0, float x1, float y1)
     float dy = y1 - y0;
     float t0 = 0.0f, t1 = 1.0f;
     float p[4] = { -dx, dx, -dy, dy };
+
+    /* We shrink the mathematical keepout zone by a tiny epsilon
+       so that moves exactly along the boundary are not considered intersecting. */
     float q[4] = {
-        x0 - atci.x_min, atci.x_max - x0,
-        y0 - atci.y_min, atci.y_max - y0
+        x0 - atci.x_min - BOUNDARY_EPSILON,
+        atci.x_max - x0 - BOUNDARY_EPSILON,
+        y0 - atci.y_min - BOUNDARY_EPSILON,
+        atci.y_max - y0 - BOUNDARY_EPSILON
     };
     for (int i = 0; i < 4; i++) {
         if (p[i] == 0) {
@@ -229,10 +240,10 @@ static bool travel_limits_check(float *target, axes_signals_t axes, bool is_cart
 
     /*
        "Technically Inside" check for messaging context.
-       Includes boundary lines. Used to determine if we give the "Stuck" message or "Blocked" message.
+       Excludes exact boundary lines so edge cases yield "Blocked" instead of "Stuck".
     */
-    bool technically_inside = (x0 >= atci.x_min && x0 <= atci.x_max &&
-                               y0 >= atci.y_min && y0 <= atci.y_max);
+    bool technically_inside = (x0 > (atci.x_min + BOUNDARY_EPSILON) && x0 < (atci.x_max - BOUNDARY_EPSILON) &&
+                               y0 > (atci.y_min + BOUNDARY_EPSILON) && y0 < (atci.y_max - BOUNDARY_EPSILON));
 
     /* Target deep inside check */
     bool target_deep_inside = (xt > (atci.x_min + KEEPOUT_TOLERANCE) &&
@@ -341,9 +352,9 @@ static void keepout_apply_travel_limits(float *target, float *current_position, 
                                  y0 > (atci.y_min + KEEPOUT_TOLERANCE) &&
                                  y0 < (atci.y_max - KEEPOUT_TOLERANCE));
 
-    /* Technical check (Are we touching or inside geometry?) */
-    bool technically_inside = (x0 >= atci.x_min && x0 <= atci.x_max &&
-                               y0 >= atci.y_min && y0 <= atci.y_max);
+    /* Technical check (Are we strictly inside geometry?) */
+    bool technically_inside = (x0 > (atci.x_min + BOUNDARY_EPSILON) && x0 < (atci.x_max - BOUNDARY_EPSILON) &&
+                               y0 > (atci.y_min + BOUNDARY_EPSILON) && y0 < (atci.y_max - BOUNDARY_EPSILON));
 
     /* Only block if we are DEEP inside. If on boundary, allow through to intersection check. */
     if (strictly_deep_inside) {
