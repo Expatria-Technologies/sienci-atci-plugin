@@ -84,6 +84,10 @@ static on_tool_selected_ptr prev_on_tool_selected = NULL;
 static on_tool_changed_ptr prev_on_tool_changed = NULL;
 static bool tc_macro_running = false;
 
+static void onReportOptions (bool newopt);
+static void onRealtimeReport (stream_write_ptr stream_write, report_tracking_flags_t report);
+static void onReportNgcParameters (void);
+
 /* Additional sensor states and inside zone marker */
 static bool drawbar_state = false;
 static bool tool_sensor_state = false;
@@ -153,8 +157,15 @@ static void keepout_tool_changed(tool_data_t *tool)
 }
 
 /* --- Sensor polling with inside zone tracking --- */
-static void poll_rack_sensor(void *data)
+static void poll_rack_sensor (void *data)
 {
+    static uint32_t counter = 0;
+
+    if (++counter < 100)
+        return;
+
+    counter = 0;
+
     if (config.flags.bits.monitor_rack_presence) {
         bool current_pin_is_low = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
         if (current_pin_is_low != atci.last_pin_state) {
@@ -182,8 +193,6 @@ static void poll_rack_sensor(void *data)
     } else {
         inside_keepout_zone = false;
     }
-
-    task_add_delayed(poll_rack_sensor, NULL, 100); /* 100ms polling */
 }
 
 /* --- Geometry --- */
@@ -495,7 +504,34 @@ static void atci_load(void)
     set_keepout_state(true, SOURCE_STARTUP);
     tc_macro_running = false;
 
-    task_add_delayed(poll_rack_sensor, NULL, 1000); /* start polling after 1s */
+    /* Hook handlers only once */
+    if (prev_check_travel_limits == NULL) {
+        prev_check_travel_limits = grbl.check_travel_limits;
+        grbl.check_travel_limits = travel_limits_check;
+        prev_apply_travel_limits = grbl.apply_travel_limits;
+        grbl.apply_travel_limits = keepout_apply_travel_limits;
+
+        memcpy(&user_mcode, &grbl.user_mcode, sizeof(user_mcode_ptrs_t));
+        grbl.user_mcode.check = mcode_check;
+        grbl.user_mcode.validate = mcode_validate;
+        grbl.user_mcode.execute = mcode_execute;
+
+        on_report_options = grbl.on_report_options;
+        grbl.on_report_options = onReportOptions;
+
+        on_realtime_report = grbl.on_realtime_report;
+        grbl.on_realtime_report = onRealtimeReport;
+
+        on_report_ngc_parameters = grbl.on_report_ngc_parameters;
+        grbl.on_report_ngc_parameters = onReportNgcParameters;
+
+        prev_on_tool_selected = grbl.on_tool_selected;
+        grbl.on_tool_selected = keepout_tool_selected;
+        prev_on_tool_changed = grbl.on_tool_changed;
+        grbl.on_tool_changed = keepout_tool_changed;
+
+        task_add_systick(poll_rack_sensor, NULL);
+    }
 }
 
 /* --- Report options & NGC params --- */
@@ -504,7 +540,7 @@ static void onReportOptions(bool newopt)
     if (on_report_options)
         on_report_options(newopt);
     if (!newopt)
-        report_plugin("SIENCI ATCi plugin", "0.4.0");
+        report_plugin("SIENCI ATCi plugin", "0.5.0");
 }
 
 static void onReportNgcParameters(void)
@@ -577,39 +613,7 @@ void atci_init(void)
     };
 
     if ((nvs_addr = nvs_alloc(sizeof(config)))) {
-        /* Load config first */
-        atci_load();
-
-        /* Hook handlers regardless of persistent plugin_enabled so we can reflect runtime state
-           and let the system dynamically enable/disable enforcement at runtime. This mirrors the
-           original behavior where the plugin could be present but keepout is managed dynamically. */
-        prev_check_travel_limits = grbl.check_travel_limits;
-        grbl.check_travel_limits = travel_limits_check;
-        prev_apply_travel_limits = grbl.apply_travel_limits;
-        grbl.apply_travel_limits = keepout_apply_travel_limits;
-
-        memcpy(&user_mcode, &grbl.user_mcode, sizeof(user_mcode_ptrs_t));
-        grbl.user_mcode.check = mcode_check;
-        grbl.user_mcode.validate = mcode_validate;
-        grbl.user_mcode.execute = mcode_execute;
-
-        on_report_options = grbl.on_report_options;
-        grbl.on_report_options = onReportOptions;
-
-        on_realtime_report = grbl.on_realtime_report;
-        grbl.on_realtime_report = onRealtimeReport;
-
-        on_report_ngc_parameters = grbl.on_report_ngc_parameters;
-        grbl.on_report_ngc_parameters = onReportNgcParameters;
-
-        prev_on_tool_selected = grbl.on_tool_selected;
-        grbl.on_tool_selected = keepout_tool_selected;
-        prev_on_tool_changed = grbl.on_tool_changed;
-        grbl.on_tool_changed = keepout_tool_changed;
-
         settings_register(&settings);
-        task_add_delayed(poll_rack_sensor, NULL, 1000); /* start polling after 1s */
-
-        report_message("Sienci ATCi plugin v0.4.0 initialized", Message_Info);
+        report_message("Sienci ATCi plugin v0.5.0 initialized", Message_Info);
     }
 }
