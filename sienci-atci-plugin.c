@@ -1,10 +1,13 @@
+#include "driver.h"
+
+#if ATCI_ENABLE && (defined(BOARD_LONGBOARD32) || defined(BOARD_LONGBOARD32_EXT))
+
 #include <stdio.h>
 #include <string.h>
 #include <stdbool.h>
 #include <math.h>
 
 #include "grbl/hal.h"
-#include "driver.h"
 #include "grbl/nvs_buffer.h"
 #include "grbl/gcode.h"
 #include "grbl/system.h"
@@ -46,11 +49,11 @@ typedef enum {
 typedef union {
     uint8_t value;
     struct {
-        uint8_t plugin_enabled        :1;
-        uint8_t monitor_rack_presence :1;
-        uint8_t monitor_tc_macro      :1;
-        uint8_t unused                :5;
-    } bits;
+        uint8_t plugin_enabled        :1,
+                monitor_rack_presence :1,
+                monitor_tc_macro      :1,
+                unused                :5;
+    };
 } config_flags_t;
 
 typedef struct {
@@ -123,7 +126,7 @@ static void keepout_set(void)
    requires both the plugin to be persistently enabled and the runtime keepout flag */
 static bool is_keepout_active(void)
 {
-    return (config.flags.bits.plugin_enabled && atci.enabled);
+    return (config.flags.plugin_enabled && atci.enabled);
 }
 
 static void set_keepout_state(bool new_state, keepout_source_t event_source)
@@ -137,7 +140,7 @@ static void set_keepout_state(bool new_state, keepout_source_t event_source)
 /* --- Tool change & rack monitoring --- */
 static void keepout_tool_selected(tool_data_t *tool)
 {
-    if (config.flags.bits.monitor_tc_macro) {
+    if (config.flags.monitor_tc_macro) {
         tc_macro_running = true;
         set_keepout_state(false, SOURCE_MACRO); /* during TC macro disable keepout */
     }
@@ -147,7 +150,7 @@ static void keepout_tool_selected(tool_data_t *tool)
 
 static void keepout_tool_changed(tool_data_t *tool)
 {
-    if (config.flags.bits.monitor_tc_macro) {
+    if (config.flags.monitor_tc_macro) {
         tc_macro_running = false;
         bool rack_is_installed = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
         set_keepout_state(rack_is_installed, SOURCE_RACK);
@@ -159,14 +162,9 @@ static void keepout_tool_changed(tool_data_t *tool)
 /* --- Sensor polling with inside zone tracking --- */
 static void poll_rack_sensor (void *data)
 {
-    static uint32_t counter = 0;
+    task_add_delayed(poll_rack_sensor, NULL, 100);
 
-    if (++counter < 100)
-        return;
-
-    counter = 0;
-
-    if (config.flags.bits.monitor_rack_presence) {
+    if (config.flags.monitor_rack_presence) {
         bool current_pin_is_low = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
         if (current_pin_is_low != atci.last_pin_state) {
             atci.last_pin_state = current_pin_is_low;
@@ -483,9 +481,6 @@ static void atci_restore(void)
 
     /* defaults: plugin persisted OFF (user must enable), monitor flags OFF */
     config.flags.value = 0;
-    config.flags.bits.plugin_enabled = 0;
-    config.flags.bits.monitor_rack_presence = 0;
-    config.flags.bits.monitor_tc_macro = 0;
 
     atci.enabled = true;
     atci.source = SOURCE_STARTUP;
@@ -530,7 +525,7 @@ static void atci_load(void)
         prev_on_tool_changed = grbl.on_tool_changed;
         grbl.on_tool_changed = keepout_tool_changed;
 
-        task_add_systick(poll_rack_sensor, NULL);
+        task_add_delayed(poll_rack_sensor, NULL, 1000);
     }
 }
 
@@ -563,38 +558,32 @@ static void onReportNgcParameters(void)
 /* --- Realtime report --- */
 static void onRealtimeReport(stream_write_ptr stream_write, report_tracking_flags_t report)
 {
-    char buf[256];
-    char flags[16];
-    size_t f = 0;
+    char buf[20] = "|ATCI:", *flags = strchr(buf, '\0');
 
     switch (atci.source) {
-        case SOURCE_RACK:    flags[f++] = 'R'; break;
-        case SOURCE_COMMAND: flags[f++] = 'M'; break;
-        case SOURCE_MACRO:   flags[f++] = 'T'; break;
-        case SOURCE_STARTUP: flags[f++] = 'S'; break;
+        case SOURCE_RACK:    *flags++ = 'R'; break;
+        case SOURCE_COMMAND: *flags++ = 'M'; break;
+        case SOURCE_MACRO:   *flags++ = 'T'; break;
+        case SOURCE_STARTUP: *flags++ = 'S'; break;
         default: break;
     }
 
     /* indicate runtime keepout state (enabled/disabled) */
     if (atci.enabled)
-        flags[f++] = 'E';
+        *flags++ = 'E';
 
-    if (config.flags.bits.monitor_rack_presence && atci.last_pin_state)
-        flags[f++] = 'I';
+    if (config.flags.monitor_rack_presence && atci.last_pin_state)
+        *flags++ = 'I';
     if (drawbar_state)
-        flags[f++] = 'B';
+        *flags++ = 'B';
     if (tool_sensor_state)
-        flags[f++] = 'L';
+        *flags++ = 'L';
     if (pressure_sensor_state)
-        flags[f++] = 'P';
+        *flags++ = 'P';
     if (inside_keepout_zone)
-        flags[f++] = 'Z';
+        *flags++ = 'Z';
 
-    flags[f] = '\0';
-
-    snprintf(buf, sizeof(buf),
-             "|ATCI:%s",
-             flags);
+    *flags = '\0';
 
     stream_write(buf);
     if (on_realtime_report)
@@ -617,3 +606,5 @@ void atci_init(void)
         report_message("Sienci ATCi plugin v0.5.0 initialized", Message_Info);
     }
 }
+
+#endif
