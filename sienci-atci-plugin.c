@@ -1,6 +1,6 @@
 #include "driver.h"
 
-#if ATCI_ENABLE && (defined(BOARD_LONGBOARD32) || defined(BOARD_LONGBOARD32_EXT))
+#if ATCI_ENABLE && (defined(BOARD_LONGBOARD32) || defined(BOARD_LONGBOARD32_EXT) || BOARD_FLEXI_HAL)
 
 #include <stdio.h>
 #include <string.h>
@@ -35,7 +35,9 @@ extern system_t sys;
 
 typedef enum {
     SOURCE_STARTUP,
+    #if(!BOARD_FLEXI_HAL)
     SOURCE_RACK,
+    #endif
     SOURCE_COMMAND,
     SOURCE_MACRO
 } keepout_source_t;
@@ -44,7 +46,9 @@ typedef union {
     uint8_t value;
     struct {
         uint8_t plugin_enabled        :1,
+                #if(!BOARD_FLEXI_HAL)
                 monitor_rack_presence :1,
+                #endif
                 monitor_tc_macro      :1,
                 unused                :5;
     };
@@ -66,7 +70,9 @@ typedef struct {
     float y_max;
     bool enabled;
     keepout_source_t source;
+    #if (!BOARD_FLEXI_HAL)
     bool last_pin_state;
+    #endif
 } atci_rt_t;
 
 static atci_config_t config;
@@ -128,6 +134,13 @@ static void set_keepout_state(bool new_state, keepout_source_t event_source)
     if (atci.enabled != new_state || atci.source != event_source) {
         atci.enabled = new_state;
         atci.source = event_source;
+
+        char buf[60];
+        const char *source_str = event_source == SOURCE_STARTUP ? "startup" :
+                                 event_source == SOURCE_COMMAND  ? "command" : "macro";
+        snprintf(buf, sizeof(buf), "ATCi keepout %s (%s)",
+                 new_state ? "enabled" : "disabled", source_str);
+        report_message(buf, Message_Info);
     }
 }
 
@@ -146,18 +159,23 @@ static void keepout_tool_changed(tool_data_t *tool)
 {
     if (config.flags.monitor_tc_macro) {
         tc_macro_running = false;
+        #if(BOARD_FLEXI_HAL)
+        set_keepout_state(tc_macro_running, SOURCE_MACRO);
+        #else
         bool rack_is_installed = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
         set_keepout_state(rack_is_installed, SOURCE_RACK);
+        #endif
     }
     if (prev_on_tool_changed)
         prev_on_tool_changed(tool);
 }
 
 /* --- Sensor polling with inside zone tracking --- */
+
 static void poll_rack_sensor (void *data)
 {
     task_add_delayed(poll_rack_sensor, NULL, 100);
-
+    #if (!BOARD_FLEXI_HAL)
     if (config.flags.monitor_rack_presence) {
         bool current_pin_is_low = !DIGITAL_IN(AUXINPUT7_PORT, AUXINPUT7_PIN);
         if (current_pin_is_low != atci.last_pin_state) {
@@ -170,7 +188,7 @@ static void poll_rack_sensor (void *data)
     drawbar_state         = !DIGITAL_IN(AUXINPUT0_PORT, AUXINPUT0_PIN);
     tool_sensor_state     = !DIGITAL_IN(AUXINPUT1_PORT, AUXINPUT1_PIN);
     pressure_sensor_state = !DIGITAL_IN(AUXINPUT2_PORT, AUXINPUT2_PIN);
-
+    #endif
     /*
        Track if we are inside keepout zone (based on planner position).
        NOTE: For Status Reporting 'Z' flag, we use the EXACT technical definition
@@ -452,7 +470,11 @@ static void mcode_execute(uint_fast16_t state, parser_block_t *gc_block)
 
 static const setting_detail_t plugin_settings[] = {
     /* persistent flags: plugin_enabled, monitor rack, monitor tc macro */
+    #if(BOARD_FLEXI_HAL)
+    { SETTING_PLUGIN_ENABLE,         Group_Limits, "ATCi Plugin",  NULL, Format_XBitfield, "Enable,Monitor TC Macro", NULL, NULL, Setting_NonCore, &config.flags.value },
+    #else
     { SETTING_PLUGIN_ENABLE,         Group_Limits, "ATCi Plugin",  NULL, Format_XBitfield, "Enable,Monitor Rack Presence,Monitor TC Macro", NULL, NULL, Setting_NonCore, &config.flags.value },
+    #endif
     { SETTING_X_MIN,                 Group_Limits, "ATCi Keepout X Min", "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_NonCore, &config.x_min },
     { SETTING_Y_MIN,                 Group_Limits, "ATCi Keepout Y Min", "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_NonCore, &config.y_min },
     { SETTING_X_MAX,                 Group_Limits, "ATCi Keepout X Max", "mm", Format_Decimal, "-####0.00", "-10000", "10000", Setting_NonCore, &config.x_max },
@@ -478,7 +500,9 @@ static void atci_restore(void)
 
     atci.enabled = true;
     atci.source = SOURCE_STARTUP;
+    #if(!BOARD_FLEXI_HAL)
     atci.last_pin_state = false;
+    #endif
 
     hal.nvs.memcpy_to_nvs(nvs_addr, (uint8_t *)&config, sizeof(config), true);
 }
@@ -555,7 +579,9 @@ static void onRealtimeReport(stream_write_ptr stream_write, report_tracking_flag
     char buf[20] = "|ATCI:", *flags = strchr(buf, '\0');
 
     switch (atci.source) {
+        #if(!BOARD_FLEXI_HAL)
         case SOURCE_RACK:    *flags++ = 'R'; break;
+        #endif
         case SOURCE_COMMAND: *flags++ = 'M'; break;
         case SOURCE_MACRO:   *flags++ = 'T'; break;
         case SOURCE_STARTUP: *flags++ = 'S'; break;
@@ -565,9 +591,10 @@ static void onRealtimeReport(stream_write_ptr stream_write, report_tracking_flag
     /* indicate runtime keepout state (enabled/disabled) */
     if (atci.enabled)
         *flags++ = 'E';
-
+    #if(!BOARD_FLEXI_HAL)
     if (config.flags.monitor_rack_presence && atci.last_pin_state)
         *flags++ = 'I';
+    #endif
     if (drawbar_state)
         *flags++ = 'B';
     if (tool_sensor_state)
@@ -599,6 +626,12 @@ void atci_init(void)
         settings_register(&settings);
         report_message("Sienci ATCi plugin v0.5.0 initialized", Message_Info);
     }
+}
+
+void atci_set_keepout_enabled(bool enabled){
+
+    set_keepout_state(enabled, SOURCE_COMMAND);
+
 }
 
 #endif
